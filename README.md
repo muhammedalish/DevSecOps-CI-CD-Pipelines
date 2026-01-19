@@ -61,6 +61,10 @@ This repository provides production-ready CI/CD pipeline implementations featuri
 - **Registry Scanning** - Continuous scanning of container registries
 - **Runtime Security** - Falco for runtime threat detection
 
+## 🛠 Demo Application
+
+For the demonstration of all pipelines, we will be using the [Damn Vulnerable NodeJS Application (DVNA)](https://github.com/appsecco/dvna) . This application serves as a practical example to showcase the security features integrated into our CI/CD pipelines.
+
 ## ⚙️ Pipeline Features
 
 ### Quality Gates
