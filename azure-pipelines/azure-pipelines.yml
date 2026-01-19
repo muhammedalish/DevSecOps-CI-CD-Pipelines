@@ -1,0 +1,12 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: Scan
+    jobs:
+      - job: Security
+        steps:
+          - script: echo "Azure Pipelines placeholder"

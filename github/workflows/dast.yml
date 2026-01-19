@@ -1,0 +1,9 @@
+name: DAST Scan
+on: [push, pull_request]
+jobs:
+  dast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Placeholder DAST step
+        run: echo "Run DAST scan"

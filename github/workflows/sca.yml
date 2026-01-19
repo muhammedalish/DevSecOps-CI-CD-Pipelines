@@ -1,0 +1,9 @@
+name: SCA Scan
+on: [push, pull_request]
+jobs:
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Placeholder SCA step
+        run: echo "Run SCA scan"

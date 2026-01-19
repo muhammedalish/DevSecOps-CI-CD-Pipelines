@@ -1,0 +1,9 @@
+name: Container Security
+on: [push, pull_request]
+jobs:
+  container-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Placeholder container scan
+        run: echo "Run container security scan"

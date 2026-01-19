@@ -1,0 +1,9 @@
+name: SAST Scan
+on: [push, pull_request]
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Placeholder SAST step
+        run: echo "Run SAST scan"

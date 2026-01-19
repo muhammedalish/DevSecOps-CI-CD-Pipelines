@@ -1,0 +1,7 @@
+stages:
+  - scan
+
+scan_job:
+  stage: scan
+  script:
+    - echo "GitLab CI placeholder scan"
