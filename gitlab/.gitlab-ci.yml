@@ -1,7 +1,216 @@
-stages:
-  - scan
+# GitLab CI/CD Pipeline for DVNA (Damn Vulnerable NodeJS Application)
+# This pipeline demonstrates security scanning, testing, and deployment for a vulnerable application
 
-scan_job:
-  stage: scan
+image: node:14
+
+variables:
+  DOCKER_IMAGE_NAME: dvna
+  DOCKER_REGISTRY: registry.gitlab.com
+  SONAR_HOST_URL: "https://sonarqube.example.com"
+  SNYK_ORG_ID: "org-id"
+
+stages:
+  - install
+  - sast
+  - sca
+  - test
+  - build
+  - scan-image
+  - deploy
+
+# ============================================
+# DEPENDENCIES & BUILD
+# ============================================
+
+install_dependencies:
+  stage: install
   script:
-    - echo "GitLab CI placeholder scan"
+    - npm install
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+  cache:
+    key: npm-$CI_COMMIT_REF_SLUG
+    paths:
+      - node_modules/
+
+# ============================================
+# STATIC APPLICATION SECURITY TESTING (SAST)
+# ============================================
+
+sast_semgrep:
+  stage: sast
+  image: returntocorp/semgrep
+  script:
+    - semgrep --config=p/security-audit --config=p/owasp-top-ten --json -o semgrep-report.json . || true
+    - semgrep --config=p/security-audit --config=p/owasp-top-ten --text . || true
+  artifacts:
+    reports:
+      sast: semgrep-report.json
+    paths:
+      - semgrep-report.json
+    expire_in: 30 days
+  allow_failure: true
+
+sast_sonarqube:
+  stage: sast
+  image: node:14
+  before_script:
+    - npm install -g sonar-scanner
+  script:
+    - sonar-scanner
+      -Dsonar.projectKey=dvna
+      -Dsonar.projectName=DVNA
+      -Dsonar.sources=.
+      -Dsonar.exclusions=node_modules/**,docs/**,public/**
+      -Dsonar.host.url=${SONAR_HOST_URL}
+      -Dsonar.login=${SONAR_TOKEN}
+  allow_failure: true
+
+# ============================================
+# SOFTWARE COMPOSITION ANALYSIS (SCA)
+# ============================================
+
+sca_npm_audit:
+  stage: sca
+  needs: ["install_dependencies"]
+  script:
+    - npm audit --json > npm-audit-report.json || true
+    - npm audit --audit-level=moderate || true
+  artifacts:
+    paths:
+      - npm-audit-report.json
+    expire_in: 30 days
+  allow_failure: true
+
+sca_snyk:
+  stage: sca
+  image: snyk/snyk:node-14
+  needs: ["install_dependencies"]
+  script:
+    - snyk auth ${SNYK_TOKEN}
+    - snyk test --severity-threshold=high --json-file-output=snyk-report.json || true
+  artifacts:
+    paths:
+      - snyk-report.json
+    expire_in: 30 days
+  allow_failure: true
+
+sca_trivy:
+  stage: sca
+  image: aquasec/trivy:latest
+  script:
+    - trivy fs --format json --output trivy-report.json . || true
+    - trivy fs --severity HIGH,CRITICAL . || true
+  artifacts:
+    paths:
+      - trivy-report.json
+    expire_in: 30 days
+  allow_failure: true
+
+# ============================================
+# UNIT TESTS
+# ============================================
+
+unit_tests:
+  stage: test
+  needs: ["install_dependencies"]
+  script:
+    - npm test 2>&1 || true
+  artifacts:
+    paths:
+      - coverage/
+    expire_in: 30 days
+  allow_failure: true
+
+# ============================================
+# BUILD DOCKER IMAGE
+# ============================================
+
+build_docker_image:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - echo $CI_JOB_TOKEN | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - docker build -t ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${CI_COMMIT_SHA} .
+    - docker build -t ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:latest .
+    - docker push ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${CI_COMMIT_SHA}
+    - docker push ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:latest
+  artifacts:
+    reports:
+      dotenv: build.env
+  allow_failure: false
+
+# ============================================
+# CONTAINER IMAGE SCANNING
+# ============================================
+
+scan_docker_image_trivy:
+  stage: scan-image
+  image: aquasec/trivy:latest
+  needs: ["build_docker_image"]
+  script:
+    - trivy image --severity HIGH,CRITICAL --exit-code 1 ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${CI_COMMIT_SHA} || true
+    - trivy image --format json --output trivy-image-report.json ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${CI_COMMIT_SHA}
+  artifacts:
+    paths:
+      - trivy-image-report.json
+    expire_in: 30 days
+  allow_failure: true
+
+scan_docker_image_grype:
+  stage: scan-image
+  image: anchore/grype:latest
+  needs: ["build_docker_image"]
+  script:
+    - grype ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${CI_COMMIT_SHA} --output json > grype-report.json || true
+    - grype ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${CI_COMMIT_SHA} --fail-on high || true
+  artifacts:
+    paths:
+      - grype-report.json
+    expire_in: 30 days
+  allow_failure: true
+
+# ============================================
+# DEPLOYMENT
+# ============================================
+
+deploy_staging:
+  stage: deploy
+  image: alpine:latest
+  needs: ["build_docker_image", "scan_docker_image_trivy"]
+  script:
+    - apk add --no-cache curl
+    - echo "Deploying DVNA to staging environment..."
+    - echo "Image ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${CI_COMMIT_SHA}"
+    - echo "Deployment URL will be available at https://dvna-staging.example.com"
+  environment:
+    name: staging
+    url: https://dvna-staging.example.com
+  only:
+    - main
+    - develop
+  allow_failure: false
+
+deploy_production:
+  stage: deploy
+  image: alpine:latest
+  needs: ["build_docker_image", "scan_docker_image_trivy"]
+  script:
+    - apk add --no-cache curl
+    - echo "Deploying DVNA to production environment..."
+    - echo "Image ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${DOCKER_IMAGE_NAME}:${CI_COMMIT_SHA}"
+    - echo "Deployment URL https://dvna.example.com"
+  environment:
+    name: production
+    url: https://dvna.example.com
+  only:
+    - main
+  when: manual
+  allow_failure: false

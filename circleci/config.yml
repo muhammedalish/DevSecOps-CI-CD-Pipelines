@@ -1,7 +1,265 @@
 version: 2.1
+
+orbs:
+  docker: circleci/docker@2.1.4
+
+workflows:
+  dvna-pipeline:
+    jobs:
+      - install_dependencies
+      - sast_semgrep:
+          requires:
+            - install_dependencies
+      - sast_sonarqube:
+          requires:
+            - install_dependencies
+      - sca_npm_audit:
+          requires:
+            - install_dependencies
+      - sca_snyk:
+          requires:
+            - install_dependencies
+      - unit_tests:
+          requires:
+            - install_dependencies
+      - build_docker_image:
+          requires:
+            - unit_tests
+            - sast_semgrep
+            - sast_sonarqube
+            - sca_npm_audit
+            - sca_snyk
+      - scan_docker_image_trivy:
+          requires:
+            - build_docker_image
+      - scan_docker_image_grype:
+          requires:
+            - build_docker_image
+      - deploy_staging:
+          requires:
+            - build_docker_image
+            - scan_docker_image_trivy
+          filters:
+            branches:
+              only:
+                - main
+                - develop
+      - deploy_production:
+          requires:
+            - build_docker_image
+            - scan_docker_image_trivy
+          filters:
+            branches:
+              only:
+                - main
+
+defaults: &defaults
+  working_directory: ~/dvna
+  docker:
+    - image: cimg/node:14.21
+
 jobs:
-  build:
+  install_dependencies:
+    <<: *defaults
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - npm-{{ checksum "package-lock.json" }}
+            - npm-
+      - run:
+          name: Install dependencies
+          command: npm install
+      - save_cache:
+          key: npm-{{ checksum "package-lock.json" }}
+          paths:
+            - node_modules/
+      - persist_to_workspace:
+          root: .
+          paths:
+            - node_modules/
+            - .
+
+  sast_semgrep:
+    docker:
+      - image: returntocorp/semgrep:latest
+    working_directory: ~/dvna
+    steps:
+      - checkout
+      - run:
+          name: Run Semgrep SAST scan
+          command: |
+            semgrep --config=p/security-audit --config=p/owasp-top-ten --json -o semgrep-report.json . || true
+            semgrep --config=p/security-audit --config=p/owasp-top-ten --text . || true
+      - store_artifacts:
+          path: semgrep-report.json
+          destination: semgrep-report.json
+
+  sast_sonarqube:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install SonarScanner
+          command: npm install -g sonar-scanner
+      - run:
+          name: Run SonarQube scan
+          command: |
+            sonar-scanner \
+              -Dsonar.projectKey=dvna \
+              -Dsonar.projectName=DVNA \
+              -Dsonar.sources=. \
+              -Dsonar.exclusions=node_modules/**,docs/**,public/** \
+              -Dsonar.host.url=${SONAR_HOST_URL} \
+              -Dsonar.login=${SONAR_TOKEN}
+      - store_artifacts:
+          path: .scannerwork/
+          destination: sonarqube-report
+
+  sca_npm_audit:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run npm audit
+          command: npm audit --json > npm-audit-report.json || true
+      - run:
+          name: Check npm audit severity
+          command: npm audit --audit-level=moderate || true
+      - store_artifacts:
+          path: npm-audit-report.json
+          destination: npm-audit-report.json
+
+  sca_snyk:
+    docker:
+      - image: snyk/snyk:node-14
+    working_directory: ~/dvna
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Authenticate with Snyk
+          command: snyk auth ${SNYK_TOKEN}
+      - run:
+          name: Run Snyk test
+          command: snyk test --severity-threshold=high --json-file-output=snyk-report.json || true
+      - store_artifacts:
+          path: snyk-report.json
+          destination: snyk-report.json
+
+  unit_tests:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run unit tests
+          command: npm test 2>&1 || true
+      - store_artifacts:
+          path: coverage/
+          destination: coverage
+      - store_test_results:
+          path: coverage/
+
+  build_docker_image:
+    machine:
+      image: ubuntu-2204:2023.07.1
+    working_directory: ~/dvna
+    steps:
+      - checkout
+      - run:
+          name: Build Docker image
+          command: |
+            docker build -t ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${CIRCLE_SHA1} .
+            docker build -t ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:latest .
+      - run:
+          name: Login to Docker registry
+          command: echo ${DOCKER_REGISTRY_PASSWORD} | docker login -u ${DOCKER_REGISTRY_USERNAME} --password-stdin ${DOCKER_REGISTRY}
+      - run:
+          name: Push Docker image
+          command: |
+            docker push ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${CIRCLE_SHA1}
+            docker push ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:latest
+      - run:
+          name: Save image metadata
+          command: |
+            mkdir -p /tmp/workspace
+            echo "export DOCKER_IMAGE=${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${CIRCLE_SHA1}" >> /tmp/workspace/image.env
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths:
+            - image.env
+
+  scan_docker_image_trivy:
+    machine:
+      image: ubuntu-2204:2023.07.1
+    working_directory: ~/dvna
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Install Trivy
+          command: |
+            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - run:
+          name: Run Trivy image scan
+          command: |
+            source /tmp/workspace/image.env
+            trivy image --severity HIGH,CRITICAL --exit-code 0 ${DOCKER_IMAGE} || true
+            trivy image --format json --output trivy-image-report.json ${DOCKER_IMAGE}
+      - store_artifacts:
+          path: trivy-image-report.json
+          destination: trivy-image-report.json
+
+  scan_docker_image_grype:
+    machine:
+      image: ubuntu-2204:2023.07.1
+    working_directory: ~/dvna
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Install Grype
+          command: |
+            curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+      - run:
+          name: Run Grype image scan
+          command: |
+            source /tmp/workspace/image.env
+            grype ${DOCKER_IMAGE} --output json > grype-report.json || true
+            grype ${DOCKER_IMAGE} --fail-on high || true
+      - store_artifacts:
+          path: grype-report.json
+          destination: grype-report.json
+
+  deploy_staging:
     docker:
       - image: cimg/base:stable
     steps:
-      - run: echo "CircleCI config placeholder"
+      - checkout
+      - run:
+          name: Deploy to staging
+          command: |
+            echo "Deploying DVNA to staging environment..."
+            echo "Image: ${DOCKER_IMAGE}"
+            echo "Deployment URL will be available at https://dvna-staging.example.com"
+
+  deploy_production:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Deploy to production
+          command: |
+            echo "Deploying DVNA to production environment..."
+            echo "Image: ${DOCKER_IMAGE}"
+            echo "Deployment URL: https://dvna.example.com"
