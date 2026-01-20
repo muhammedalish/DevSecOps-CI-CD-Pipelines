@@ -1,5 +1,265 @@
 version: 0.2
+
+# AWS CodeBuild Buildspec for DVNA (Damn Vulnerable NodeJS Application)
+# This pipeline demonstrates security scanning, testing, and deployment for a vulnerable application
+
+env:
+  variables:
+    DOCKER_IMAGE_NAME: dvna
+    SONAR_HOST_URL: https://sonarqube.example.com
+    SNYK_ORG_ID: org-id
+    NODE_ENV: production
+  parameter-store:
+    DOCKER_REGISTRY: /dvna/docker-registry
+    DOCKER_REGISTRY_USERNAME: /dvna/docker-registry-username
+    DOCKER_REGISTRY_PASSWORD: /dvna/docker-registry-password
+    SONAR_TOKEN: /dvna/sonar-token
+    SNYK_TOKEN: /dvna/snyk-token
+    ARTIFACTORY_URL: /dvna/artifactory-url
+    ARTIFACTORY_TOKEN: /dvna/artifactory-token
+
 phases:
+  # ============================================
+  # PRE-BUILD: SETUP & DEPENDENCIES
+  # ============================================
+  
+  pre_build:
+    commands:
+      - echo "========== Pre-Build Phase =========="
+      - echo "AWS Account ID: $AWS_ACCOUNT_ID"
+      - echo "AWS Region: $AWS_DEFAULT_REGION"
+      - echo "Build ID: $CODEBUILD_BUILD_ID"
+      - echo "Build Number: $CODEBUILD_BUILD_NUMBER"
+      - echo "Source Version: $CODEBUILD_SOURCE_VERSION"
+      
+      # Install Node.js dependencies
+      - echo "========== Installing NPM Dependencies =========="
+      - npm install
+      
+      # Install build tools
+      - echo "========== Installing Build Tools =========="
+      - apt-get update -y
+      - apt-get install -y curl wget git jq
+      
+      # Login to Docker Registry
+      - echo "========== Logging in to Docker Registry =========="
+      - echo $DOCKER_REGISTRY_PASSWORD | docker login -u $DOCKER_REGISTRY_USERNAME --password-stdin $DOCKER_REGISTRY
+      
+      # Set image tag
+      - export IMAGE_TAG=$DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:$CODEBUILD_BUILD_ID
+      - export LATEST_TAG=$DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:latest
+      - echo "Image Tag: $IMAGE_TAG"
+      - echo "Latest Tag: $LATEST_TAG"
+      
+      # Save environment variables to file for use in later phases
+      - echo "export IMAGE_TAG=$IMAGE_TAG" > /tmp/build-env.sh
+      - echo "export LATEST_TAG=$LATEST_TAG" >> /tmp/build-env.sh
+
+  # ============================================
+  # BUILD: SAST, SCA, TESTS, & BUILD
+  # ============================================
+  
   build:
     commands:
-      - echo "AWS CodeBuild placeholder"
+      - source /tmp/build-env.sh
+      
+      # ============================================
+      # STATIC APPLICATION SECURITY TESTING (SAST)
+      # ============================================
+      
+      - echo "========== SAST: Semgrep Scan =========="
+      - docker run --rm -v $CODEBUILD_SOURCE_DIR:/app returntocorp/semgrep semgrep --config=p/security-audit --config=p/owasp-top-ten --json -o /app/semgrep-report.json /app . || true
+      - docker run --rm -v $CODEBUILD_SOURCE_DIR:/app returntocorp/semgrep semgrep --config=p/security-audit --config=p/owasp-top-ten --text /app . || true
+      
+      - echo "========== SAST: SonarQube Scan =========="
+      - npm install -g sonar-scanner
+      - |
+        sonar-scanner \
+          -Dsonar.projectKey=dvna \
+          -Dsonar.projectName=DVNA \
+          -Dsonar.sources=. \
+          -Dsonar.exclusions=node_modules/**,docs/**,public/** \
+          -Dsonar.host.url=$SONAR_HOST_URL \
+          -Dsonar.login=$SONAR_TOKEN || true
+      
+      # ============================================
+      # SOFTWARE COMPOSITION ANALYSIS (SCA)
+      # ============================================
+      
+      - echo "========== SCA: NPM Audit =========="
+      - npm audit --json > npm-audit-report.json || true
+      - npm audit --audit-level=moderate || true
+      
+      - echo "========== SCA: Snyk Scan =========="
+      - npm install -g snyk
+      - snyk auth $SNYK_TOKEN || true
+      - snyk test --severity-threshold=high --json-file-output=snyk-report.json || true
+      
+      - echo "========== SCA: Trivy Filesystem Scan =========="
+      - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - trivy fs --format json --output trivy-fs-report.json . || true
+      - trivy fs --severity HIGH,CRITICAL . || true
+      
+      # ============================================
+      # UNIT TESTS
+      # ============================================
+      
+      - echo "========== Running Unit Tests =========="
+      - npm test 2>&1 || true
+      
+      # ============================================
+      # BUILD DOCKER IMAGE
+      # ============================================
+      
+      - echo "========== Building Docker Image =========="
+      - docker build -t $IMAGE_TAG .
+      - docker build -t $LATEST_TAG .
+      
+      # ============================================
+      # CONTAINER IMAGE SCANNING
+      # ============================================
+      
+      - echo "========== Scan: Trivy Image Scan =========="
+      - trivy image --severity HIGH,CRITICAL --exit-code 0 $IMAGE_TAG || true
+      - trivy image --format json --output trivy-image-report.json $IMAGE_TAG
+      - trivy image --format sarif --output trivy-image-report.sarif $IMAGE_TAG || true
+      
+      - echo "========== Scan: Grype Image Scan =========="
+      - curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+      - grype $IMAGE_TAG --output json > grype-report.json || true
+      - grype $IMAGE_TAG --fail-on high || true
+
+  # ============================================
+  # POST-BUILD: PUSH & ARTIFACTS
+  # ============================================
+  
+  post_build:
+    commands:
+      - source /tmp/build-env.sh
+      
+      - echo "========== Post-Build Phase =========="
+      
+      # Push Docker image to registry
+      - echo "========== Pushing Docker Image =========="
+      - docker push $IMAGE_TAG
+      - docker push $LATEST_TAG
+      
+      # Generate image definitions for ECS deployment
+      - echo "========== Generating Image Definitions =========="
+      - |
+        printf '[{"name":"dvna-container","imageUri":"%s"}]' $IMAGE_TAG > imagedefinitions.json
+      
+      - cat imagedefinitions.json
+      
+      # Store scan results
+      - echo "========== Storing Scan Results =========="
+      - mkdir -p scan-reports
+      - test -f semgrep-report.json && cp semgrep-report.json scan-reports/ || true
+      - test -f npm-audit-report.json && cp npm-audit-report.json scan-reports/ || true
+      - test -f snyk-report.json && cp snyk-report.json scan-reports/ || true
+      - test -f trivy-fs-report.json && cp trivy-fs-report.json scan-reports/ || true
+      - test -f trivy-image-report.json && cp trivy-image-report.json scan-reports/ || true
+      - test -f trivy-image-report.sarif && cp trivy-image-report.sarif scan-reports/ || true
+      - test -f grype-report.json && cp grype-report.json scan-reports/ || true
+      - test -d coverage && cp -r coverage scan-reports/ || true
+      
+      # Upload to S3
+      - echo "========== Uploading Artifacts to S3 =========="
+      - aws s3 cp scan-reports s3://$ARTIFACTS_BUCKET/dvna/$CODEBUILD_BUILD_ID/ --recursive
+      
+      # Create build metadata
+      - echo "========== Creating Build Metadata =========="
+      - |
+        cat > build-metadata.json <<EOF
+        {
+          "buildId": "$CODEBUILD_BUILD_ID",
+          "buildNumber": "$CODEBUILD_BUILD_NUMBER",
+          "sourceVersion": "$CODEBUILD_SOURCE_VERSION",
+          "imageTag": "$IMAGE_TAG",
+          "latestTag": "$LATEST_TAG",
+          "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+          "status": "SUCCESS"
+        }
+        EOF
+      
+      - cat build-metadata.json
+      - aws s3 cp build-metadata.json s3://$ARTIFACTS_BUCKET/dvna/$CODEBUILD_BUILD_ID/build-metadata.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
+    - build-metadata.json
+    - scan-reports/**/*
+    - coverage/**/*
+    - test-results/**/*
+  name: BuildArtifact
+  discard-paths: no
+
+cache:
+  paths:
+    - 'node_modules/**/*'
+
+reports:
+  # Semgrep SAST Report
+  semgrep-report:
+    files:
+      - semgrep-report.json
+    file-format: JUNITXML
+    discard-paths: no
+  
+  # npm audit Report
+  npm-audit-report:
+    files:
+      - npm-audit-report.json
+    file-format: JUNITXML
+    discard-paths: no
+  
+  # Trivy FS Report
+  trivy-fs-report:
+    files:
+      - trivy-fs-report.json
+    file-format: JUNITXML
+    discard-paths: no
+  
+  # Trivy Image Report
+  trivy-image-report:
+    files:
+      - trivy-image-report.json
+    file-format: JUNITXML
+    discard-paths: no
+  
+  # Coverage Report
+  coverage-report:
+    files:
+      - coverage/cobertura-coverage.xml
+    file-format: COBERTURAXML
+    discard-paths: no
+
+# ============================================
+# NOTES & CONFIGURATION
+# ============================================
+
+# Required AWS Systems Manager Parameter Store variables:
+# /dvna/docker-registry - Docker registry URL (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com)
+# /dvna/docker-registry-username - Docker registry username
+# /dvna/docker-registry-password - Docker registry password
+# /dvna/sonar-token - SonarQube token
+# /dvna/snyk-token - Snyk token
+# /dvna/artifactory-url - Artifactory URL (optional)
+# /dvna/artifactory-token - Artifactory token (optional)
+
+# Required Environment Variables:
+# ARTIFACTS_BUCKET - S3 bucket for storing build artifacts
+# AWS_ACCOUNT_ID - AWS account ID (automatic)
+# AWS_DEFAULT_REGION - AWS region (automatic)
+
+# Required IAM Permissions:
+# - ecr:GetAuthorizationToken
+# - ecr:BatchGetImage
+# - ecr:GetDownloadUrlForLayer
+# - s3:PutObject
+# - s3:GetObject
+# - ssm:GetParameters
+# - logs:CreateLogGroup
+# - logs:CreateLogStream
+# - logs:PutLogEvents

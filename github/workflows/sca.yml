@@ -1,9 +1,112 @@
 name: SCA Scan
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_call:
+    secrets:
+      SNYK_TOKEN:
+        required: false
+
 jobs:
-  sca:
+  npm-audit:
+    name: NPM Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Placeholder SCA step
-        run: echo "Run SCA scan"
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm install
+      
+      - name: Run npm audit
+        run: |
+          npm audit --json > npm-audit-report.json || true
+          npm audit --audit-level=moderate || true
+      
+      - name: Upload npm audit report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: npm-audit-report
+          path: npm-audit-report.json
+          retention-days: 30
+
+  snyk:
+    name: Snyk Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm install
+      
+      - name: Run Snyk scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --json-file-output=snyk-report.json
+        continue-on-error: true
+      
+      - name: Upload Snyk report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: snyk-report
+          path: snyk-report.json
+          retention-days: 30
+
+  trivy-fs:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Run Trivy filesystem scan (SARIF)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-report.sarif'
+      
+      - name: Upload Trivy SARIF report
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-fs-report.sarif'
+          category: trivy-fs
+      
+      - name: Run Trivy filesystem scan (JSON)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-fs-report.json'
+      
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: trivy-fs-report
+          path: trivy-fs-report.json
+          retention-days: 30

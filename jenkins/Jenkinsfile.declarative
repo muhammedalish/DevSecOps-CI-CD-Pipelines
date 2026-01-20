@@ -1,10 +1,294 @@
+// Jenkins Declarative Pipeline for DVNA (Damn Vulnerable NodeJS Application)
+// This pipeline demonstrates security scanning, testing, and deployment for a vulnerable application
+
 pipeline {
     agent any
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 2, unit: 'HOURS')
+        timestamps()
+    }
+    
+    environment {
+        DOCKER_IMAGE_NAME = 'dvna'
+        DOCKER_REGISTRY = 'registry.example.com'
+        SONAR_HOST_URL = 'https://sonarqube.example.com'
+        SNYK_ORG_ID = 'org-id'
+        PATH = "${PATH}:${WORKSPACE}/node_modules/.bin"
+    }
+    
     stages {
-        stage('Placeholder') {
+        // ============================================
+        // DEPENDENCIES & BUILD
+        // ============================================
+        
+        stage('Install Dependencies') {
             steps {
-                echo 'Declarative Jenkinsfile placeholder'
+                script {
+                    echo '========== Installing NPM Dependencies =========='
+                    sh 'npm install'
+                }
             }
+        }
+        
+        // ============================================
+        // STATIC APPLICATION SECURITY TESTING (SAST)
+        // ============================================
+        
+        stage('SAST: Semgrep') {
+            steps {
+                script {
+                    echo '========== Running Semgrep SAST Scan =========='
+                    sh '''
+                        docker run --rm -v ${WORKSPACE}:/app returntocorp/semgrep \
+                            semgrep --config=p/security-audit --config=p/owasp-top-ten --json -o semgrep-report.json /app . || true
+                        docker run --rm -v ${WORKSPACE}:/app returntocorp/semgrep \
+                            semgrep --config=p/security-audit --config=p/owasp-top-ten --text /app . || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'semgrep-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('SAST: SonarQube') {
+            when {
+                expression { env.SONAR_TOKEN != null }
+            }
+            steps {
+                script {
+                    echo '========== Running SonarQube Scan =========='
+                    sh '''
+                        npm install -g sonar-scanner
+                        sonar-scanner \
+                            -Dsonar.projectKey=dvna \
+                            -Dsonar.projectName=DVNA \
+                            -Dsonar.sources=. \
+                            -Dsonar.exclusions=node_modules/**,docs/**,public/** \
+                            -Dsonar.host.url=${SONAR_HOST_URL} \
+                            -Dsonar.login=${SONAR_TOKEN}
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: '.scannerwork/**', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        // ============================================
+        // SOFTWARE COMPOSITION ANALYSIS (SCA)
+        // ============================================
+        
+        stage('SCA: NPM Audit') {
+            steps {
+                script {
+                    echo '========== Running NPM Audit =========='
+                    sh '''
+                        npm audit --json > npm-audit-report.json || true
+                        npm audit --audit-level=moderate || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'npm-audit-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('SCA: Snyk') {
+            when {
+                expression { env.SNYK_TOKEN != null }
+            }
+            steps {
+                script {
+                    echo '========== Running Snyk Test =========='
+                    sh '''
+                        docker run --rm \
+                            -e SNYK_TOKEN=${SNYK_TOKEN} \
+                            -v ${WORKSPACE}:/app \
+                            snyk/snyk:node-14 \
+                            snyk test --severity-threshold=high --json-file-output=/app/snyk-report.json || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'snyk-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('SCA: Trivy FS Scan') {
+            steps {
+                script {
+                    echo '========== Running Trivy Filesystem Scan =========='
+                    sh '''
+                        docker run --rm -v ${WORKSPACE}:/app aquasec/trivy:latest \
+                            fs --format json --output /app/trivy-fs-report.json /app || true
+                        docker run --rm -v ${WORKSPACE}:/app aquasec/trivy:latest \
+                            fs --severity HIGH,CRITICAL /app || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-fs-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        // ============================================
+        // UNIT TESTS
+        // ============================================
+        
+        stage('Unit Tests') {
+            steps {
+                script {
+                    echo '========== Running Unit Tests =========='
+                    sh 'npm test 2>&1 || true'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'coverage/**', allowEmptyArchive: true
+                    publishHTML(target: [
+                        reportDir: 'coverage',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ])
+                }
+            }
+        }
+        
+        // ============================================
+        // BUILD DOCKER IMAGE
+        // ============================================
+        
+        stage('Build Docker Image') {
+            agent {
+                label 'docker'
+            }
+            steps {
+                script {
+                    echo '========== Building Docker Image =========='
+                    sh '''
+                        docker build -t ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} .
+                        docker build -t ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:latest .
+                    '''
+                }
+            }
+        }
+        
+        // ============================================
+        // CONTAINER IMAGE SCANNING
+        // ============================================
+        
+        stage('Scan: Trivy Image') {
+            agent {
+                label 'docker'
+            }
+            steps {
+                script {
+                    echo '========== Running Trivy Image Scan =========='
+                    sh '''
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
+                            image --severity HIGH,CRITICAL --exit-code 0 ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} || true
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
+                            image --format json --output trivy-image-report.json ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${BUILD_NUMBER}
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-image-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('Scan: Grype Image') {
+            agent {
+                label 'docker'
+            }
+            steps {
+                script {
+                    echo '========== Running Grype Image Scan =========='
+                    sh '''
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v ${WORKSPACE}:/app anchore/grype:latest \
+                            ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} --output json > /app/grype-report.json || true
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                            anchore/grype:latest \
+                            ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} --fail-on high || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'grype-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        // ============================================
+        // DEPLOYMENT
+        // ============================================
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'main' || branch 'develop'
+            }
+            steps {
+                script {
+                    echo '========== Deploying to Staging =========='
+                    sh '''
+                        echo "Deploying DVNA to staging environment..."
+                        echo "Image: ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${BUILD_NUMBER}"
+                        echo "Deployment URL: https://dvna-staging.example.com"
+                        # Add your actual deployment commands here
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            input {
+                message "Deploy to production?"
+                ok "Deploy"
+            }
+            steps {
+                script {
+                    echo '========== Deploying to Production =========='
+                    sh '''
+                        echo "Deploying DVNA to production environment..."
+                        echo "Image: ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${BUILD_NUMBER}"
+                        echo "Deployment URL: https://dvna.example.com"
+                        # Add your actual deployment commands here
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '========== Pipeline Execution Completed =========='
+            cleanWs()
+        }
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+        failure {
+            echo 'Pipeline failed!'
         }
     }
 }

@@ -1,9 +1,84 @@
 name: SAST Scan
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_call:
+    secrets:
+      SONAR_HOST_URL:
+        required: false
+      SONAR_TOKEN:
+        required: false
+
 jobs:
-  sast:
+  semgrep:
+    name: Semgrep SAST Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Placeholder SAST step
-        run: echo "Run SAST scan"
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Run Semgrep scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >
+            p/security-audit
+            p/owasp-top-ten
+          generateSarif: true
+      
+      - name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+      
+      - name: Upload Semgrep report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: semgrep-report
+          path: semgrep.json
+          retention-days: 30
+
+  sonarqube:
+    name: SonarQube SAST Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm install
+      
+      - name: Run SonarQube scan
+        run: |
+          npm install -g sonar-scanner
+          sonar-scanner \
+            -Dsonar.projectKey=dvna \
+            -Dsonar.projectName=DVNA \
+            -Dsonar.sources=. \
+            -Dsonar.exclusions=node_modules/**,docs/**,public/** \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      
+      - name: Upload SonarQube report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: sonarqube-report
+          path: .scannerwork/
+          retention-days: 30

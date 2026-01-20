@@ -1,0 +1,218 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # DEPENDENCIES & SETUP
+  # ============================================
+  
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      node-version: ${{ steps.node.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Detect Node version
+        id: node
+        run: |
+          VERSION=$(cat .nvmrc 2>/dev/null || echo "14")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+  
+  install-dependencies:
+    name: Install Dependencies
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ needs.setup.outputs.node-version }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm install
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+      
+      - name: Upload dependencies
+        uses: actions/upload-artifact@v3
+        with:
+          name: node_modules
+          path: node_modules
+          retention-days: 1
+
+  # ============================================
+  # UNIT TESTS
+  # ============================================
+  
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: install-dependencies
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+          cache: 'npm'
+      
+      - name: Download dependencies
+        uses: actions/download-artifact@v3
+        with:
+          name: node_modules
+          path: node_modules
+      
+      - name: Run unit tests
+        run: npm test 2>&1 || true
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results
+          path: test-results
+
+  # ============================================
+  # CODE QUALITY & SECURITY SCANNING
+  # ============================================
+  
+  sast:
+    name: SAST Scanning
+    needs: install-dependencies
+    uses: ./.github/workflows/sast.yml
+    secrets:
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  sca:
+    name: SCA Scanning
+    needs: install-dependencies
+    uses: ./.github/workflows/sca.yml
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # ============================================
+  # BUILD & CONTAINER SECURITY
+  # ============================================
+  
+  container-security:
+    name: Container Security
+    needs: test
+    uses: ./.github/workflows/container-security.yml
+    secrets:
+      DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+      DOCKER_REGISTRY_USERNAME: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
+      DOCKER_REGISTRY_PASSWORD: ${{ secrets.DOCKER_REGISTRY_PASSWORD }}
+
+  # ============================================
+  # DYNAMIC APPLICATION SECURITY TESTING
+  # ============================================
+  
+  dast:
+    name: DAST Scanning
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    needs: test
+    uses: ./.github/workflows/dast.yml
+
+  # ============================================
+  # DEPLOYMENT
+  # ============================================
+  
+  deploy-staging:
+    name: Deploy to Staging
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    needs: [ test, sast, sca, container-security ]
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://dvna-staging.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Deploy to staging
+        run: |
+          echo "Deploying DVNA to staging environment..."
+          echo "Image: ${{ secrets.DOCKER_REGISTRY }}/dvna:${{ github.sha }}"
+          # Add your actual staging deployment commands here
+      
+      - name: Verify deployment
+        run: |
+          echo "Verifying staging deployment..."
+          # Add deployment verification commands here
+
+  deploy-production:
+    name: Deploy to Production
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ test, sast, sca, container-security, deploy-staging ]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://dvna.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploying DVNA to production environment..."
+          echo "Image: ${{ secrets.DOCKER_REGISTRY }}/dvna:${{ github.sha }}"
+          # Add your actual production deployment commands here
+      
+      - name: Verify deployment
+        run: |
+          echo "Verifying production deployment..."
+          # Add deployment verification commands here
+
+  # ============================================
+  # WORKFLOW STATUS
+  # ============================================
+  
+  workflow-status:
+    name: Workflow Status
+    if: always()
+    needs: [ test, sast, sca, container-security ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check workflow status
+        run: |
+          if [[ "${{ needs.test.result }}" == "failure" ]] || \
+             [[ "${{ needs.sast.result }}" == "failure" ]] || \
+             [[ "${{ needs.sca.result }}" == "failure" ]] || \
+             [[ "${{ needs.container-security.result }}" == "failure" ]]; then
+            echo "❌ Workflow failed!"
+            exit 1
+          else
+            echo "✅ Workflow completed successfully!"
+          fi

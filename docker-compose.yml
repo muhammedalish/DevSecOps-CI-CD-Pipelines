@@ -1,5 +1,15 @@
-version: '3.8'
+# Damn Vulnerable NodeJS Application
+
+version: "2.1"
 services:
-  placeholder:
-    image: alpine:3.18
-    command: ["/bin/sh", "-c", "echo Docker Compose placeholder && sleep 3600"]
+  app:
+    image: appsecco/dvna:sqlite
+    ports:
+      - 9090:9090
+
+  # mysql-db:
+  #   image: mysql:5.7
+  #   expose:
+  #     - "3306"
+  #   env_file:
+  #     - ./vars.env
