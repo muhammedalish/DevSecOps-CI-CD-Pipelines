@@ -103,7 +103,8 @@ For the demonstration of all pipelines, we will be using the [Damn Vulnerable No
 │   │   ├── sast.yml
 │   │   ├── sca.yml
 │   │   ├── dast.yml
-│   │   └── container-security.yml
+│   │   ├── container-security.yml
+│   │   └── ci-cd.yml
 │   └── actions/
 ├── circleci/                   # CircleCI configurations
 │   ├── config.yml
@@ -113,26 +114,9 @@ For the demonstration of all pipelines, we will be using the [Damn Vulnerable No
 │   └── templates/
 ├── aws-codepipeline/           # AWS CodePipeline configurations
 │   └── buildspec.yml
-├── terraform/                  # IaC scanning examples
-│   ├── security-policies/
-│   └── examples/
-├── docker/                     # Container security examples
-│   ├── Dockerfile
-│   ├── scanning-config/
-│   └── signing/
-├── kubernetes/                 # K8s security policies
-│   ├── pod-security/
-│   ├── network-policies/
-│   └── rbac/
 ├── scripts/                    # Utility and helper scripts
 │   ├── notify.sh
 │   ├── create-tickets.sh
-│   ├── scan-results-parser.sh
-│   └── policy-checker.sh
-├── policies/                   # Security policy definitions
-│   ├── opa-policies/
-│   ├── sentinel-policies/
-│   └── custom-policies/
 ├── docker-compose.yml          # Local testing environment
 └── README.md                   # This file
 ```
